@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::env;
 use std::error::Error;
 use std::fmt;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -382,31 +382,62 @@ fn take_first(windows: &mut Vec<RateWindow>) -> Option<RateWindow> {
 }
 
 fn print_text(snapshot: &Snapshot) {
-    println!("Codex limits (local CLI RPC)");
+    let color = use_color();
+    let rule = "──────────────────────────────────────────";
 
-    match &snapshot.limits.session {
-        Some(window) => print_window("5-hour", window),
-        None => println!("5-hour: not available"),
-    }
-
-    match &snapshot.limits.weekly {
-        Some(window) => print_window("Weekly", window),
-        None => println!("Weekly: not available"),
-    }
-
+    println!(
+        "  {}  {}",
+        paint("Codex limits", "1;36", color),
+        paint("local Codex CLI RPC", "2", color),
+    );
+    println!("  {}", paint(rule, "2", color));
+    print_section("5-hour", snapshot.limits.session.as_ref(), color);
+    print_section("Weekly", snapshot.limits.weekly.as_ref(), color);
 }
 
-fn print_window(label: &str, window: &RateWindow) {
+fn print_section(label: &str, window: Option<&RateWindow>, color: bool) {
+    let label_styled = paint(&format!("{label:<7}"), "1", color);
+
+    let Some(window) = window else {
+        println!("  {label_styled} {}", paint("not available", "2", color));
+        return;
+    };
+
     let remaining = (100.0 - window.used_percent).clamp(0.0, 100.0);
-    println!(
-        "{label}: {} remaining ({} used) {}",
-        format_percent(remaining),
-        format_percent(window.used_percent),
-        usage_bar(remaining, 20)
-    );
+    let bar = usage_bar(remaining, 20);
+    let bar_styled = paint(&bar, bar_color_code(remaining), color);
+    let pct_styled = paint(&format!("{} left", format_percent(remaining)), "1", color);
+
+    println!("  {label_styled} {bar_styled}  {pct_styled}");
 
     if let Some(resets_at) = window.resets_at {
-        println!("  Reset: {}", format_reset(resets_at));
+        println!(
+            "          {} {}",
+            paint("↻ Resets", "2", color),
+            paint(&format_reset(resets_at), "2", color),
+        );
+    }
+}
+
+fn use_color() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn paint(text: &str, code: &str, enabled: bool) -> String {
+    if enabled {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn bar_color_code(remaining: f64) -> &'static str {
+    if remaining >= 50.0 {
+        "32"
+    } else if remaining >= 20.0 {
+        "33"
+    } else {
+        "31"
     }
 }
 
@@ -421,7 +452,7 @@ fn format_percent(value: f64) -> String {
 fn usage_bar(remaining_percent: f64, width: usize) -> String {
     let filled = ((remaining_percent / 100.0) * width as f64).round() as usize;
     let filled = filled.min(width);
-    format!("[{}{}]", "#".repeat(filled), "-".repeat(width - filled))
+    format!("{}{}", "▰".repeat(filled), "▱".repeat(width - filled))
 }
 
 fn format_reset(timestamp: i64) -> String {
@@ -430,13 +461,13 @@ fn format_reset(timestamp: i64) -> String {
     let absolute = Local
         .timestamp_opt(timestamp, 0)
         .single()
-        .map(|time| time.format("%Y-%m-%d %H:%M:%S %Z").to_string())
+        .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| timestamp.to_string());
 
-    if delta == 0 {
-        format!("now ({absolute})")
+    if delta <= 0 {
+        format!("now · {absolute}")
     } else {
-        format!("in {} ({absolute})", human_duration(delta))
+        format!("in {} · {absolute}", human_duration(delta))
     }
 }
 
