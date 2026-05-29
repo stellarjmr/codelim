@@ -32,6 +32,13 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    if options.live && (options.json || options.raw) {
+        return Err(cli_error("--live cannot be combined with --json or --raw"));
+    }
+    if options.live && !std::io::stdout().is_terminal() {
+        return Err(cli_error("--live requires a TTY on stdout"));
+    }
+
     let mut client = CodexRpcClient::spawn(&options.codex_bin, options.verbose)?;
 
     let _: Value = client.request(
@@ -46,11 +53,11 @@ fn run() -> Result<()> {
     )?;
     client.notify("initialized", json!({}))?;
 
-    let raw_limits: Value = client.request(
-        "account/rateLimits/read",
-        json!({}),
-        Duration::from_secs(3),
-    )?;
+    if options.live {
+        return run_live(&mut client, Duration::from_secs(options.interval));
+    }
+
+    let raw_limits: Value = fetch_rate_limits(&mut client)?;
     let limits_response: RateLimitsResponse = serde_json::from_value(raw_limits.clone())?;
 
     if options.raw {
@@ -69,10 +76,54 @@ fn run() -> Result<()> {
     if options.json {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
     } else {
-        print_text(&snapshot);
+        print!("{}", render_text(&snapshot, use_color()));
     }
 
     Ok(())
+}
+
+fn fetch_rate_limits(client: &mut CodexRpcClient) -> Result<Value> {
+    client.request(
+        "account/rateLimits/read",
+        json!({}),
+        Duration::from_secs(3),
+    )
+}
+
+fn run_live(client: &mut CodexRpcClient, interval: Duration) -> Result<()> {
+    let color = use_color();
+    let mut stdout = std::io::stdout().lock();
+    let mut prev_lines = 0usize;
+
+    loop {
+        let raw_limits = fetch_rate_limits(client)?;
+        let limits_response: RateLimitsResponse = serde_json::from_value(raw_limits)?;
+        let snapshot = Snapshot::from_rpc(limits_response.rate_limits);
+
+        let body = render_text(&snapshot, color);
+        let footer = render_live_footer(interval, color);
+        let frame = format!("{body}{footer}\n");
+
+        if prev_lines > 0 {
+            write!(stdout, "\x1b[{prev_lines}F\x1b[J")?;
+        }
+        write!(stdout, "{frame}")?;
+        stdout.flush()?;
+
+        prev_lines = frame.matches('\n').count();
+
+        thread::sleep(interval);
+    }
+}
+
+fn render_live_footer(interval: Duration, color: bool) -> String {
+    let now = Local::now().format("%H:%M:%S");
+    let secs = interval.as_secs().max(1);
+    paint(
+        &format!("  updated {now} · every {secs}s · Ctrl-C to exit"),
+        "2",
+        color,
+    )
 }
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -97,6 +148,8 @@ struct Options {
     codex_bin: String,
     json: bool,
     raw: bool,
+    live: bool,
+    interval: u64,
     verbose: bool,
     help: bool,
     version: bool,
@@ -110,6 +163,8 @@ impl Options {
                 .unwrap_or_else(|_| "codex".to_string()),
             json: false,
             raw: false,
+            live: false,
+            interval: 10,
             verbose: false,
             help: false,
             version: false,
@@ -122,6 +177,19 @@ impl Options {
                 "-V" | "--version" => options.version = true,
                 "--json" => options.json = true,
                 "--raw" => options.raw = true,
+                "--live" => options.live = true,
+                "--interval" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| cli_error("--interval requires a number of seconds"))?;
+                    let secs: u64 = value
+                        .parse()
+                        .map_err(|_| cli_error(format!("--interval expects an integer, got `{value}`")))?;
+                    if secs == 0 {
+                        return Err(cli_error("--interval must be at least 1 second"));
+                    }
+                    options.interval = secs;
+                }
                 "-v" | "--verbose" => options.verbose = true,
                 "--codex-bin" => {
                     options.codex_bin = args
@@ -141,7 +209,7 @@ fn print_help() {
         "{APP_NAME} {APP_VERSION}\n\n\
 Minimal local Codex quota checker.\n\n\
 USAGE:\n    codelim [OPTIONS]\n\n\
-OPTIONS:\n    --json              Print normalized JSON\n    --raw               Print raw Codex limit windows\n    --codex-bin <PATH>  Codex executable path (default: codex)\n    -v, --verbose       Print Codex app-server stderr\n    -h, --help          Print help\n    -V, --version       Print version\n\n\
+OPTIONS:\n    --json              Print normalized JSON\n    --raw               Print raw Codex limit windows\n    --live              Continuously refresh in-place (requires a TTY)\n    --interval <SECS>   Refresh interval for --live (default: 10)\n    --codex-bin <PATH>  Codex executable path (default: codex)\n    -v, --verbose       Print Codex app-server stderr\n    -h, --help          Print help\n    -V, --version       Print version\n\n\
 It starts: codex -s read-only -a untrusted app-server\n\
 and reads account/rateLimits/read from the local Codex CLI session."
     );
@@ -381,25 +449,31 @@ fn take_first(windows: &mut Vec<RateWindow>) -> Option<RateWindow> {
     }
 }
 
-fn print_text(snapshot: &Snapshot) {
-    let color = use_color();
+fn render_text(snapshot: &Snapshot, color: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
     let rule = "──────────────────────────────────────────";
 
-    println!(
+    let _ = writeln!(
+        out,
         "  {}  {}",
         paint("Codex limits", "1;36", color),
         paint("local Codex CLI RPC", "2", color),
     );
-    println!("  {}", paint(rule, "2", color));
-    print_section("5-hour", snapshot.limits.session.as_ref(), color);
-    print_section("Weekly", snapshot.limits.weekly.as_ref(), color);
+    let _ = writeln!(out, "  {}", paint(rule, "2", color));
+    render_section(&mut out, "5-hour", snapshot.limits.session.as_ref(), color);
+    render_section(&mut out, "Weekly", snapshot.limits.weekly.as_ref(), color);
+    out
 }
 
-fn print_section(label: &str, window: Option<&RateWindow>, color: bool) {
+fn render_section(out: &mut String, label: &str, window: Option<&RateWindow>, color: bool) {
+    use std::fmt::Write as _;
+
     let label_styled = paint(&format!("{label:<7}"), "1", color);
 
     let Some(window) = window else {
-        println!("  {label_styled} {}", paint("not available", "2", color));
+        let _ = writeln!(out, "  {label_styled} {}", paint("not available", "2", color));
         return;
     };
 
@@ -408,10 +482,11 @@ fn print_section(label: &str, window: Option<&RateWindow>, color: bool) {
     let bar_styled = paint(&bar, bar_color_code(remaining), color);
     let pct_styled = paint(&format!("{} left", format_percent(remaining)), "1", color);
 
-    println!("  {label_styled} {bar_styled}  {pct_styled}");
+    let _ = writeln!(out, "  {label_styled} {bar_styled}  {pct_styled}");
 
     if let Some(resets_at) = window.resets_at {
-        println!(
+        let _ = writeln!(
+            out,
             "          {} {}",
             paint("↻ Resets", "2", color),
             paint(&format_reset(resets_at), "2", color),

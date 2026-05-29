@@ -4,6 +4,10 @@ All notable changes to `codelim` are tracked here.
 
 ## Unreleased
 
+## 0.1.2 - 2026-05-29
+
+- Added `--live` flag to continuously refresh the limits display in place, with `--interval <SECS>` (default 10) to control the cadence. Live mode reuses the same Codex RPC session, redraws using ANSI cursor controls (`ESC[<N>F ESC[J`), and prints a footer showing `updated HH:MM:SS · every Ns · Ctrl-C to exit`. Refuses to run when stdout is not a TTY or when combined with `--json` / `--raw`.
+
 ## 0.1.1 - 2026-05-28
 
 - Refreshed the default text output: title + horizontal rule header, then one bar line and one indented `↻ Resets in <delta> · YYYY-MM-DD HH:MM` line per window, with no blank-line padding between sections. Bars use Unicode `▰`/`▱` and are colorized (green/yellow/red by remaining percentage) only when stdout is a TTY and `NO_COLOR` is unset. JSON and `--raw` output are unchanged.
