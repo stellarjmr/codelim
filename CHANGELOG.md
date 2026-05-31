@@ -4,6 +4,10 @@ All notable changes to `codelim` are tracked here.
 
 ## Unreleased
 
+## 0.1.3 - 2026-05-31
+
+- Live mode now accepts a single `q` keypress to exit immediately, while keeping `Ctrl-C` as a graceful exit path that restores terminal input mode.
+
 ## 0.1.2 - 2026-05-29
 
 - Added `--live` flag to continuously refresh the limits display in place, with `--interval <SECS>` (default 10) to control the cadence. Live mode reuses the same Codex RPC session, redraws using ANSI cursor controls (`ESC[<N>F ESC[J`), and prints a footer showing `updated HH:MM:SS · every Ns · Ctrl-C to exit`. Refuses to run when stdout is not a TTY or when combined with `--json` / `--raw`.

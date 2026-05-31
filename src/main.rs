@@ -4,9 +4,9 @@ use serde_json::{json, Value};
 use std::env;
 use std::error::Error;
 use std::fmt;
-use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,11 @@ fn run() -> Result<()> {
     }
     if options.live && !std::io::stdout().is_terminal() {
         return Err(cli_error("--live requires a TTY on stdout"));
+    }
+    if options.live && !std::io::stdin().is_terminal() {
+        return Err(cli_error(
+            "--live requires a TTY on stdin for q/Ctrl-C exit",
+        ));
     }
 
     let mut client = CodexRpcClient::spawn(&options.codex_bin, options.verbose)?;
@@ -83,15 +88,13 @@ fn run() -> Result<()> {
 }
 
 fn fetch_rate_limits(client: &mut CodexRpcClient) -> Result<Value> {
-    client.request(
-        "account/rateLimits/read",
-        json!({}),
-        Duration::from_secs(3),
-    )
+    client.request("account/rateLimits/read", json!({}), Duration::from_secs(3))
 }
 
 fn run_live(client: &mut CodexRpcClient, interval: Duration) -> Result<()> {
     let color = use_color();
+    let _terminal = LiveTerminalMode::enter()?;
+    let input_rx = spawn_live_input_reader();
     let mut stdout = std::io::stdout().lock();
     let mut prev_lines = 0usize;
 
@@ -112,18 +115,104 @@ fn run_live(client: &mut CodexRpcClient, interval: Duration) -> Result<()> {
 
         prev_lines = frame.matches('\n').count();
 
-        thread::sleep(interval);
+        if wait_for_live_exit(&input_rx, interval) {
+            break;
+        }
     }
+
+    Ok(())
 }
 
 fn render_live_footer(interval: Duration, color: bool) -> String {
     let now = Local::now().format("%H:%M:%S");
     let secs = interval.as_secs().max(1);
     paint(
-        &format!("  updated {now} · every {secs}s · Ctrl-C to exit"),
+        &format!("  updated {now} · every {secs}s · q/Ctrl-C to exit"),
         "2",
         color,
     )
+}
+
+fn spawn_live_input_reader() -> Receiver<()> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut byte = [0u8; 1];
+
+        loop {
+            match stdin.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) if matches!(byte[0], b'q' | b'Q' | 0x03) => {
+                    let _ = tx.send(());
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+
+    rx
+}
+
+fn wait_for_live_exit(input_rx: &Receiver<()>, interval: Duration) -> bool {
+    match input_rx.recv_timeout(interval) {
+        Ok(()) => true,
+        Err(RecvTimeoutError::Timeout) => false,
+        Err(RecvTimeoutError::Disconnected) => {
+            thread::sleep(interval);
+            false
+        }
+    }
+}
+
+struct LiveTerminalMode {
+    fd: libc::c_int,
+    original: libc::termios,
+}
+
+impl LiveTerminalMode {
+    fn enter() -> Result<Self> {
+        let fd = libc::STDIN_FILENO;
+
+        // Use non-canonical input so a single `q` keypress can stop live mode
+        // without waiting for Enter. Disable terminal-generated signals too so
+        // Ctrl-C exits through the same cleanup path and restores the TTY mode.
+        unsafe {
+            let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+            if libc::tcgetattr(fd, original.as_mut_ptr()) != 0 {
+                return Err(cli_error(format!(
+                    "failed to read terminal input mode: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+
+            let original = original.assume_init();
+            let mut live = original;
+            live.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+            live.c_cc[libc::VMIN] = 1;
+            live.c_cc[libc::VTIME] = 0;
+
+            if libc::tcsetattr(fd, libc::TCSANOW, &live) != 0 {
+                return Err(cli_error(format!(
+                    "failed to configure terminal input mode: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+
+            Ok(Self { fd, original })
+        }
+    }
+}
+
+impl Drop for LiveTerminalMode {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
 }
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -182,9 +271,9 @@ impl Options {
                     let value = args
                         .next()
                         .ok_or_else(|| cli_error("--interval requires a number of seconds"))?;
-                    let secs: u64 = value
-                        .parse()
-                        .map_err(|_| cli_error(format!("--interval expects an integer, got `{value}`")))?;
+                    let secs: u64 = value.parse().map_err(|_| {
+                        cli_error(format!("--interval expects an integer, got `{value}`"))
+                    })?;
                     if secs == 0 {
                         return Err(cli_error("--interval must be at least 1 second"));
                     }
@@ -209,7 +298,7 @@ fn print_help() {
         "{APP_NAME} {APP_VERSION}\n\n\
 Minimal local Codex quota checker.\n\n\
 USAGE:\n    codelim [OPTIONS]\n\n\
-OPTIONS:\n    --json              Print normalized JSON\n    --raw               Print raw Codex limit windows\n    --live              Continuously refresh in-place (requires a TTY)\n    --interval <SECS>   Refresh interval for --live (default: 10)\n    --codex-bin <PATH>  Codex executable path (default: codex)\n    -v, --verbose       Print Codex app-server stderr\n    -h, --help          Print help\n    -V, --version       Print version\n\n\
+OPTIONS:\n    --json              Print normalized JSON\n    --raw               Print raw Codex limit windows\n    --live              Continuously refresh in-place; press q to exit (requires a TTY)\n    --interval <SECS>   Refresh interval for --live (default: 10)\n    --codex-bin <PATH>  Codex executable path (default: codex)\n    -v, --verbose       Print Codex app-server stderr\n    -h, --help          Print help\n    -V, --version       Print version\n\n\
 It starts: codex -s read-only -a untrusted app-server\n\
 and reads account/rateLimits/read from the local Codex CLI session."
     );
@@ -259,8 +348,9 @@ impl CodexRpcClient {
                         if trimmed.is_empty() {
                             continue;
                         }
-                        let message = serde_json::from_str::<Value>(trimmed)
-                            .map_err(|error| format!("invalid JSON from Codex: {error}: {trimmed}"));
+                        let message = serde_json::from_str::<Value>(trimmed).map_err(|error| {
+                            format!("invalid JSON from Codex: {error}: {trimmed}")
+                        });
                         if tx.send(message).is_err() {
                             break;
                         }
@@ -329,7 +419,9 @@ impl CodexRpcClient {
             let message = self
                 .rx
                 .recv_timeout(remaining)
-                .map_err(|_| cli_error(format!("Codex app-server closed before `{method}` replied")))?
+                .map_err(|_| {
+                    cli_error(format!("Codex app-server closed before `{method}` replied"))
+                })?
                 .map_err(cli_error)?;
 
             if message.get("id").and_then(Value::as_u64) != Some(id) {
@@ -410,8 +502,10 @@ impl Snapshot {
             .flatten()
             .collect::<Vec<_>>();
 
-        let session = take_window(&mut windows, WindowRole::Session).or_else(|| take_first(&mut windows));
-        let weekly = take_window(&mut windows, WindowRole::Weekly).or_else(|| take_first(&mut windows));
+        let session =
+            take_window(&mut windows, WindowRole::Session).or_else(|| take_first(&mut windows));
+        let weekly =
+            take_window(&mut windows, WindowRole::Weekly).or_else(|| take_first(&mut windows));
 
         Self {
             provider: "codex",
@@ -473,7 +567,11 @@ fn render_section(out: &mut String, label: &str, window: Option<&RateWindow>, co
     let label_styled = paint(&format!("{label:<7}"), "1", color);
 
     let Some(window) = window else {
-        let _ = writeln!(out, "  {label_styled} {}", paint("not available", "2", color));
+        let _ = writeln!(
+            out,
+            "  {label_styled} {}",
+            paint("not available", "2", color)
+        );
         return;
     };
 
@@ -560,4 +658,3 @@ fn human_duration(seconds: i64) -> String {
         format!("{mins}m")
     }
 }
-
