@@ -28,11 +28,15 @@ codelim
 Options:
 
 ```bash
-codelim --json
-codelim --raw
-codelim --codex-bin /path/to/codex
+codelim --json                       # normalized JSON output
+codelim --raw                        # raw Codex limit-window fields as JSON
+codelim --live                       # continuously refresh in place (TTY only, default every 10s)
+codelim --live --interval 3          # refresh every 3 seconds
+codelim --codex-bin /path/to/codex   # override Codex executable path
 codelim --help
 ```
+
+`--live` redraws the same block of lines in place using ANSI cursor controls and prints a footer with the last update time and refresh interval. Press `Ctrl-C` to exit. It is rejected when stdout is not a TTY or when combined with `--json` / `--raw`.
 
 ## What it does
 
@@ -52,8 +56,8 @@ Then it sends JSON-RPC requests to initialize the local app server and read `acc
 Releases are built by GitHub Actions on tag pushes:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 The release workflow runs on `macos-14`, verifies `arm64`, builds `target/release/codelim`, and uploads `codelim-v<version>-macos-arm64.tar.gz` plus a SHA-256 checksum.
