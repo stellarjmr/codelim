@@ -5,6 +5,7 @@ All notable changes to `codelim` are tracked here.
 ## Unreleased
 
 - Fixed intermittent `Codex app-server closed before account/rateLimits/read replied` failures by distinguishing RPC timeouts from actual disconnects, allowing more time for limit reads, and automatically restarting and reinitializing the app-server before retrying. Live mode now keeps recovering on later refreshes instead of exiting on a temporary connection failure.
+- Fixed weekly-only responses being mislabeled as the 5-hour/session limit by classifying all known window durations before applying positional fallback for unknown windows.
 
 ## 0.1.3 - 2026-05-31
 

@@ -51,6 +51,8 @@ Then it sends JSON-RPC requests to initialize the local app server and read `acc
 - `300` minutes → 5-hour/session window
 - `10080` minutes → weekly window
 
+Known durations are classified before positional fallback, so a response containing only a weekly window remains weekly instead of being mislabeled as the 5-hour/session limit.
+
 If the Codex app-server temporarily closes or stops responding during a limit read, `codelim` restarts it, initializes a fresh RPC session, and retries the read once. In `--live` mode, a connection failure that remains after that retry is tried again on the next refresh instead of terminating the display.
 
 ## Release

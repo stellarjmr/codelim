@@ -581,10 +581,10 @@ impl Snapshot {
             .flatten()
             .collect::<Vec<_>>();
 
-        let session =
-            take_window(&mut windows, WindowRole::Session).or_else(|| take_first(&mut windows));
-        let weekly =
-            take_window(&mut windows, WindowRole::Weekly).or_else(|| take_first(&mut windows));
+        let session = take_window(&mut windows, WindowRole::Session);
+        let weekly = take_window(&mut windows, WindowRole::Weekly);
+        let session = session.or_else(|| take_first(&mut windows));
+        let weekly = weekly.or_else(|| take_first(&mut windows));
 
         Self {
             provider: "codex",
@@ -735,5 +735,53 @@ fn human_duration(seconds: i64) -> String {
         format!("{hours}h {mins}m")
     } else {
         format!("{mins}m")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(duration_mins: Option<i64>) -> RateWindow {
+        RateWindow {
+            used_percent: 25.0,
+            window_duration_mins: duration_mins,
+            resets_at: None,
+        }
+    }
+
+    fn snapshot(primary: Option<RateWindow>, secondary: Option<RateWindow>) -> Snapshot {
+        Snapshot::from_rpc(RateLimitSnapshot { primary, secondary })
+    }
+
+    fn duration(window: &Option<RateWindow>) -> Option<i64> {
+        window
+            .as_ref()
+            .and_then(|window| window.window_duration_mins)
+    }
+
+    #[test]
+    fn keeps_a_weekly_only_window_in_the_weekly_slot() {
+        let snapshot = snapshot(Some(window(Some(10080))), None);
+
+        assert!(snapshot.limits.session.is_none());
+        assert_eq!(duration(&snapshot.limits.weekly), Some(10080));
+    }
+
+    #[test]
+    fn classifies_known_windows_before_falling_back_to_unknown_windows() {
+        let snapshot = snapshot(Some(window(Some(10080))), Some(window(None)));
+
+        assert!(snapshot.limits.session.is_some());
+        assert_eq!(duration(&snapshot.limits.session), None);
+        assert_eq!(duration(&snapshot.limits.weekly), Some(10080));
+    }
+
+    #[test]
+    fn classifies_known_windows_regardless_of_rpc_order() {
+        let snapshot = snapshot(Some(window(Some(10080))), Some(window(Some(300))));
+
+        assert_eq!(duration(&snapshot.limits.session), Some(300));
+        assert_eq!(duration(&snapshot.limits.weekly), Some(10080));
     }
 }
