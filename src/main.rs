@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 const APP_NAME: &str = "codelim";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(8);
+const RATE_LIMITS_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() {
     if let Err(error) = run() {
@@ -44,25 +46,13 @@ fn run() -> Result<()> {
         ));
     }
 
-    let mut client = CodexRpcClient::spawn(&options.codex_bin, options.verbose)?;
-
-    let _: Value = client.request(
-        "initialize",
-        json!({
-            "clientInfo": {
-                "name": APP_NAME,
-                "version": APP_VERSION,
-            }
-        }),
-        Duration::from_secs(8),
-    )?;
-    client.notify("initialized", json!({}))?;
+    let mut session = CodexRpcSession::connect(&options.codex_bin, options.verbose)?;
 
     if options.live {
-        return run_live(&mut client, Duration::from_secs(options.interval));
+        return run_live(&mut session, Duration::from_secs(options.interval));
     }
 
-    let raw_limits: Value = fetch_rate_limits(&mut client)?;
+    let raw_limits: Value = session.fetch_rate_limits()?;
     let limits_response: RateLimitsResponse = serde_json::from_value(raw_limits.clone())?;
 
     if options.raw {
@@ -87,11 +77,7 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn fetch_rate_limits(client: &mut CodexRpcClient) -> Result<Value> {
-    client.request("account/rateLimits/read", json!({}), Duration::from_secs(3))
-}
-
-fn run_live(client: &mut CodexRpcClient, interval: Duration) -> Result<()> {
+fn run_live(session: &mut CodexRpcSession, interval: Duration) -> Result<()> {
     let color = use_color();
     let _terminal = LiveTerminalMode::enter()?;
     let input_rx = spawn_live_input_reader();
@@ -99,7 +85,16 @@ fn run_live(client: &mut CodexRpcClient, interval: Duration) -> Result<()> {
     let mut prev_lines = 0usize;
 
     loop {
-        let raw_limits = fetch_rate_limits(client)?;
+        let raw_limits = match session.fetch_rate_limits() {
+            Ok(raw_limits) => raw_limits,
+            Err(error) if is_rpc_transport_error(error.as_ref()) => {
+                if wait_for_live_exit(&input_rx, interval) {
+                    break;
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let limits_response: RateLimitsResponse = serde_json::from_value(raw_limits)?;
         let snapshot = Snapshot::from_rpc(limits_response.rate_limits);
 
@@ -233,6 +228,25 @@ fn cli_error(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {
 }
 
 #[derive(Debug)]
+struct RpcTransportError(String);
+
+impl fmt::Display for RpcTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for RpcTransportError {}
+
+fn rpc_transport_error(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {
+    Box::new(RpcTransportError(message.into()))
+}
+
+fn is_rpc_transport_error(error: &(dyn Error + Send + Sync + 'static)) -> bool {
+    error.downcast_ref::<RpcTransportError>().is_some()
+}
+
+#[derive(Debug)]
 struct Options {
     codex_bin: String,
     json: bool,
@@ -302,6 +316,59 @@ OPTIONS:\n    --json              Print normalized JSON\n    --raw              
 It starts: codex -s read-only -a untrusted app-server\n\
 and reads account/rateLimits/read from the local Codex CLI session."
     );
+}
+
+struct CodexRpcSession {
+    codex_bin: String,
+    verbose: bool,
+    client: CodexRpcClient,
+}
+
+impl CodexRpcSession {
+    fn connect(codex_bin: &str, verbose: bool) -> Result<Self> {
+        let client = Self::start_client(codex_bin, verbose)?;
+        Ok(Self {
+            codex_bin: codex_bin.to_string(),
+            verbose,
+            client,
+        })
+    }
+
+    fn start_client(codex_bin: &str, verbose: bool) -> Result<CodexRpcClient> {
+        let mut client = CodexRpcClient::spawn(codex_bin, verbose)?;
+        let _: Value = client.request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": APP_NAME,
+                    "version": APP_VERSION,
+                }
+            }),
+            INITIALIZE_TIMEOUT,
+        )?;
+        client.notify("initialized", json!({}))?;
+        Ok(client)
+    }
+
+    fn fetch_rate_limits(&mut self) -> Result<Value> {
+        match self.fetch_rate_limits_once() {
+            Ok(rate_limits) => Ok(rate_limits),
+            Err(error) if is_rpc_transport_error(error.as_ref()) => {
+                if self.verbose {
+                    eprintln!("[codelim] {error}; restarting Codex app-server");
+                }
+
+                self.client = Self::start_client(&self.codex_bin, self.verbose)?;
+                self.fetch_rate_limits_once()
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn fetch_rate_limits_once(&mut self) -> Result<Value> {
+        self.client
+            .request("account/rateLimits/read", json!({}), RATE_LIMITS_TIMEOUT)
+    }
 }
 
 struct CodexRpcClient {
@@ -410,19 +477,25 @@ impl CodexRpcClient {
         loop {
             let now = Instant::now();
             if now >= deadline {
-                return Err(cli_error(format!(
+                return Err(rpc_transport_error(format!(
                     "Codex RPC timed out waiting for `{method}`"
                 )));
             }
 
             let remaining = deadline.saturating_duration_since(now);
-            let message = self
-                .rx
-                .recv_timeout(remaining)
-                .map_err(|_| {
-                    cli_error(format!("Codex app-server closed before `{method}` replied"))
-                })?
-                .map_err(cli_error)?;
+            let message = match self.rx.recv_timeout(remaining) {
+                Ok(message) => message.map_err(rpc_transport_error)?,
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(rpc_transport_error(format!(
+                        "Codex RPC timed out waiting for `{method}`"
+                    )));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(rpc_transport_error(format!(
+                        "Codex app-server closed before `{method}` replied"
+                    )));
+                }
+            };
 
             if message.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
@@ -446,9 +519,15 @@ impl CodexRpcClient {
     }
 
     fn send(&mut self, payload: Value) -> Result<()> {
-        serde_json::to_writer(&mut self.stdin, &payload)?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
+        serde_json::to_writer(&mut self.stdin, &payload).map_err(|error| {
+            rpc_transport_error(format!("failed writing to Codex app-server: {error}"))
+        })?;
+        self.stdin.write_all(b"\n").map_err(|error| {
+            rpc_transport_error(format!("failed writing to Codex app-server: {error}"))
+        })?;
+        self.stdin.flush().map_err(|error| {
+            rpc_transport_error(format!("failed writing to Codex app-server: {error}"))
+        })?;
         Ok(())
     }
 }

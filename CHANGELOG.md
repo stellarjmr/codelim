@@ -4,6 +4,8 @@ All notable changes to `codelim` are tracked here.
 
 ## Unreleased
 
+- Fixed intermittent `Codex app-server closed before account/rateLimits/read replied` failures by distinguishing RPC timeouts from actual disconnects, allowing more time for limit reads, and automatically restarting and reinitializing the app-server before retrying. Live mode now keeps recovering on later refreshes instead of exiting on a temporary connection failure.
+
 ## 0.1.3 - 2026-05-31
 
 - Live mode now accepts a single `q` keypress to exit immediately, while keeping `Ctrl-C` as a graceful exit path that restores terminal input mode.
