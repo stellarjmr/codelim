@@ -60,8 +60,8 @@ If the Codex app-server temporarily closes or stops responding during a limit re
 Releases are built by GitHub Actions on tag pushes:
 
 ```bash
-git tag v0.1.4
-git push origin v0.1.4
+git tag v0.1.5
+git push origin v0.1.5
 ```
 
 The release workflow runs on `macos-14`, verifies `arm64`, builds `target/release/codelim`, and uploads `codelim-v<version>-macos-arm64.tar.gz` plus a SHA-256 checksum.
