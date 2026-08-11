@@ -83,24 +83,28 @@ fn run_live(session: &mut CodexRpcSession, interval: Duration) -> Result<()> {
     let input_rx = spawn_live_input_reader();
     let mut stdout = std::io::stdout().lock();
     let mut prev_lines = 0usize;
+    let mut last_body: Option<String> = None;
 
     loop {
-        let raw_limits = match session.fetch_rate_limits() {
-            Ok(raw_limits) => raw_limits,
-            Err(error) if is_rpc_transport_error(error.as_ref()) => {
-                if wait_for_live_exit(&input_rx, interval) {
-                    break;
-                }
-                continue;
+        let fetch_error = match session
+            .fetch_rate_limits()
+            .and_then(|raw_limits| Ok(serde_json::from_value::<RateLimitsResponse>(raw_limits)?))
+        {
+            Ok(limits_response) => {
+                let snapshot = Snapshot::from_rpc(limits_response.rate_limits);
+                last_body = Some(render_text(&snapshot, color));
+                None
             }
-            Err(error) => return Err(error),
+            Err(error) => Some(error.to_string()),
         };
-        let limits_response: RateLimitsResponse = serde_json::from_value(raw_limits)?;
-        let snapshot = Snapshot::from_rpc(limits_response.rate_limits);
 
-        let body = render_text(&snapshot, color);
+        let body = last_body.as_deref().unwrap_or("");
+        let error_line = fetch_error
+            .as_deref()
+            .map(|error| render_live_error(error, color))
+            .unwrap_or_default();
         let footer = render_live_footer(interval, color);
-        let frame = format!("{body}{footer}\n");
+        let frame = format!("{body}{error_line}{footer}\n");
 
         if prev_lines > 0 {
             write!(stdout, "\x1b[{prev_lines}F\x1b[J")?;
@@ -116,6 +120,27 @@ fn run_live(session: &mut CodexRpcSession, interval: Duration) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn render_live_error(error: &str, color: bool) -> String {
+    let now = Local::now().format("%H:%M:%S");
+    let message = truncate_chars(&error.replace(['\n', '\r'], " "), 70);
+    format!(
+        "{}\n",
+        paint(
+            &format!("  ⚠ {now} fetch failed, retrying: {message}"),
+            "31",
+            color
+        )
+    )
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{truncated}…")
 }
 
 fn render_live_footer(interval: Duration, color: bool) -> String {

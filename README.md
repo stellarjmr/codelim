@@ -53,7 +53,7 @@ Then it sends JSON-RPC requests to initialize the local app server and read `acc
 
 Known durations are classified before positional fallback, so a response containing only a weekly window remains weekly instead of being mislabeled as the 5-hour/session limit.
 
-If the Codex app-server temporarily closes or stops responding during a limit read, `codelim` restarts it, initializes a fresh RPC session, and retries the read once. In `--live` mode, a connection failure that remains after that retry is tried again on the next refresh instead of terminating the display.
+If the Codex app-server temporarily closes or stops responding during a limit read, `codelim` restarts it, initializes a fresh RPC session, and retries the read once. In `--live` mode, any failed refresh — including temporary backend errors such as `503 Service Unavailable` from the Codex usage endpoint — keeps the last successful snapshot on screen, shows a one-line `⚠ HH:MM:SS fetch failed, retrying: …` notice, and retries on the next interval instead of terminating the display.
 
 ## Release
 
