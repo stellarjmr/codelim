@@ -4,6 +4,8 @@ All notable changes to `codelim` are tracked here.
 
 ## Unreleased
 
+- Fixed startup with Codex CLI 0.149.0 and newer by removing the obsolete `--ask-for-approval untrusted` argument, which caused the app-server to exit before replying to `initialize`. Limit reads remain sandboxed as read-only.
+
 ## 0.1.5 - 2026-08-11
 
 - Fixed `--live` exiting after long runs when the Codex backend returned a temporary upstream error (for example `GET https://chatgpt.com/backend-api/wham/usage failed: 503 Service Unavailable`). Such failures arrive as RPC error responses rather than transport failures, so live mode treated them as fatal. Live mode now never exits on a failed refresh: it keeps showing the last successful snapshot, adds a one-line red `⚠ HH:MM:SS fetch failed, retrying: …` notice (truncated to avoid line wrapping breaking the in-place redraw), and retries on the next interval. The notice disappears after the next successful refresh. One-shot (non-live) runs still report such errors and exit as before.

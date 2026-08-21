@@ -338,7 +338,7 @@ fn print_help() {
 Minimal local Codex quota checker.\n\n\
 USAGE:\n    codelim [OPTIONS]\n\n\
 OPTIONS:\n    --json              Print normalized JSON\n    --raw               Print raw Codex limit windows\n    --live              Continuously refresh in-place; press q to exit (requires a TTY)\n    --interval <SECS>   Refresh interval for --live (default: 10)\n    --codex-bin <PATH>  Codex executable path (default: codex)\n    -v, --verbose       Print Codex app-server stderr\n    -h, --help          Print help\n    -V, --version       Print version\n\n\
-It starts: codex -s read-only -a untrusted app-server\n\
+It starts: codex -s read-only app-server\n\
 and reads account/rateLimits/read from the local Codex CLI session."
     );
 }
@@ -406,7 +406,7 @@ struct CodexRpcClient {
 impl CodexRpcClient {
     fn spawn(codex_bin: &str, verbose: bool) -> Result<Self> {
         let mut child = Command::new(codex_bin)
-            .args(["-s", "read-only", "-a", "untrusted", "app-server"])
+            .args(["-s", "read-only", "app-server"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

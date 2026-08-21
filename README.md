@@ -43,7 +43,7 @@ codelim --help
 Internally, `codelim` starts:
 
 ```bash
-codex -s read-only -a untrusted app-server
+codex -s read-only app-server
 ```
 
 Then it sends JSON-RPC requests to initialize the local app server and read `account/rateLimits/read`. The returned limit windows are normalized as:
