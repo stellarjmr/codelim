@@ -4,6 +4,8 @@ All notable changes to `codelim` are tracked here.
 
 ## Unreleased
 
+## 0.1.6 - 2026-08-21
+
 - Fixed startup with Codex CLI 0.149.0 and newer by removing the obsolete `--ask-for-approval untrusted` argument, which caused the app-server to exit before replying to `initialize`. Limit reads remain sandboxed as read-only.
 
 ## 0.1.5 - 2026-08-11
