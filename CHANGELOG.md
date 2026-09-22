@@ -4,6 +4,8 @@ All notable changes to `codelim` are tracked here.
 
 ## Unreleased
 
+## 0.1.7 - 2026-09-22
+
 - Replaced the text progress bar's geometric `▰`/`▱` symbols with 20-cell `━`/`┄` line bars and removed the `↻` reset icon to avoid oversized fallback glyphs. Solid segments still represent remaining quota; percentages, colors, reset times, live refresh behavior, and JSON/`--raw` output are unchanged.
 
 ## 0.1.6 - 2026-08-21
