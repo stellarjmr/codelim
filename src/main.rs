@@ -690,7 +690,7 @@ fn render_section(out: &mut String, label: &str, window: Option<&RateWindow>, co
         let _ = writeln!(
             out,
             "          {} {}",
-            paint("↻ Resets", "2", color),
+            paint("Resets", "2", color),
             paint(&format_reset(resets_at), "2", color),
         );
     }
@@ -729,7 +729,7 @@ fn format_percent(value: f64) -> String {
 fn usage_bar(remaining_percent: f64, width: usize) -> String {
     let filled = ((remaining_percent / 100.0) * width as f64).round() as usize;
     let filled = filled.min(width);
-    format!("{}{}", "▰".repeat(filled), "▱".repeat(width - filled))
+    format!("{}{}", "━".repeat(filled), "┄".repeat(width - filled))
 }
 
 fn format_reset(timestamp: i64) -> String {
@@ -808,5 +808,41 @@ mod tests {
 
         assert_eq!(duration(&snapshot.limits.session), Some(300));
         assert_eq!(duration(&snapshot.limits.weekly), Some(10080));
+    }
+
+    #[test]
+    fn renders_twenty_cell_line_bars() {
+        for (remaining, expected) in [
+            (0.0, "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"),
+            (43.0, "━━━━━━━━━┄┄┄┄┄┄┄┄┄┄┄"),
+            (100.0, "━━━━━━━━━━━━━━━━━━━━"),
+        ] {
+            assert_eq!(usage_bar(remaining, 20), expected);
+        }
+    }
+
+    #[test]
+    fn renders_remaining_quota_with_a_plain_reset_label() {
+        let snapshot = snapshot(
+            None,
+            Some(RateWindow {
+                used_percent: 57.0,
+                window_duration_mins: Some(10080),
+                resets_at: Some(0),
+            }),
+        );
+
+        for color in [false, true] {
+            let text = render_text(&snapshot, color);
+            assert!(text.contains("━━━━━━━━━┄┄┄┄┄┄┄┄┄┄┄"));
+            assert!(text.contains("43% left"));
+            let reset_prefix = if color {
+                "          \x1b[2mResets\x1b[0m \x1b[2mnow · "
+            } else {
+                "          Resets now · "
+            };
+            assert!(text.contains(reset_prefix));
+            assert!(!text.contains('↻'));
+        }
     }
 }

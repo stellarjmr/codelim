@@ -25,6 +25,18 @@ The Homebrew formula installs a prebuilt macOS Apple Silicon binary from GitHub 
 codelim
 ```
 
+Text output uses a 20-cell line bar: solid `━` segments show remaining quota, and dashed `┄` segments show used quota. Reset lines use plain `Resets` without an icon. These box-drawing characters avoid the geometric-symbol font fallback that can make the previous bars look oversized; no Nerd Font or terminal configuration change is required.
+
+Example output when only a weekly window is available:
+
+```text
+  Codex limits  local Codex CLI RPC
+  ──────────────────────────────────────────
+  5-hour  not available
+  Weekly  ━━━━━━━━━┄┄┄┄┄┄┄┄┄┄┄  43% left
+          Resets in 5d 23h · 2026-09-28 14:57
+```
+
 Options:
 
 ```bash

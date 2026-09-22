@@ -4,6 +4,8 @@ All notable changes to `codelim` are tracked here.
 
 ## Unreleased
 
+- Replaced the text progress bar's geometric `▰`/`▱` symbols with 20-cell `━`/`┄` line bars and removed the `↻` reset icon to avoid oversized fallback glyphs. Solid segments still represent remaining quota; percentages, colors, reset times, live refresh behavior, and JSON/`--raw` output are unchanged.
+
 ## 0.1.6 - 2026-08-21
 
 - Fixed startup with Codex CLI 0.149.0 and newer by removing the obsolete `--ask-for-approval untrusted` argument, which caused the app-server to exit before replying to `initialize`. Limit reads remain sandboxed as read-only.
