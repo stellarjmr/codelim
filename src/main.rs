@@ -1,3 +1,5 @@
+mod claude;
+
 use chrono::{Local, TimeZone};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -34,6 +36,11 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    if !options.claude_config_dirs.is_empty() && options.provider == Provider::Codex {
+        return Err(cli_error(
+            "--claude-config-dir cannot be combined with --provider codex",
+        ));
+    }
     if options.live && (options.json || options.raw) {
         return Err(cli_error("--live cannot be combined with --json or --raw"));
     }
@@ -46,65 +53,233 @@ fn run() -> Result<()> {
         ));
     }
 
-    let mut session = CodexRpcSession::connect(&options.codex_bin, options.verbose)?;
+    let mut entries = Vec::new();
+    if options.provider != Provider::Claude {
+        entries.push(LimitEntry::new(
+            LimitClient::Codex {
+                codex_bin: options.codex_bin.clone(),
+                verbose: options.verbose,
+                session: None,
+            },
+            options.interval,
+        ));
+    }
+    if options.provider != Provider::Codex {
+        for client in claude::ClaudeClient::discover(&options.claude_config_dirs)? {
+            entries.push(LimitEntry::new(
+                LimitClient::Claude(client),
+                options.interval,
+            ));
+        }
+    }
 
     if options.live {
-        return run_live(&mut session, Duration::from_secs(options.interval));
+        let cadence = match (options.interval, options.provider) {
+            (Some(seconds), _) => format!("every {seconds}s"),
+            (None, Provider::All) => "Codex 10s · Claude 180s".to_string(),
+            (None, Provider::Codex) => "every 10s".to_string(),
+            (None, Provider::Claude) => "every 180s".to_string(),
+        };
+        return run_live(&mut entries, &cadence);
     }
 
-    let raw_limits: Value = session.fetch_rate_limits()?;
-    let limits_response: RateLimitsResponse = serde_json::from_value(raw_limits.clone())?;
-
-    if options.raw {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "primary": &limits_response.rate_limits.primary,
-                "secondary": &limits_response.rate_limits.secondary,
-            }))?
-        );
-        return Ok(());
+    for entry in &mut entries {
+        entry.refresh_if_due();
+    }
+    // Keep the original single-Codex output contract when explicitly selected.
+    if options.provider == Provider::Codex {
+        if let Some(error) = &entries[0].error {
+            return Err(cli_error(error.clone()));
+        }
     }
 
-    let snapshot = Snapshot::from_rpc(limits_response.rate_limits);
-
-    if options.json {
-        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    if options.raw || options.json {
+        let mut results = entries
+            .iter()
+            .map(|entry| entry.json(options.raw))
+            .collect::<Result<Vec<_>>>()?;
+        let output = if options.provider == Provider::Codex {
+            let mut result = results.remove(0);
+            if options.raw {
+                result["windows"].take()
+            } else {
+                result
+            }
+        } else {
+            json!({"results": results})
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        print!("{}", render_text(&snapshot, use_color()));
+        print!("{}", render_entries(&entries, use_color(), false));
+    }
+    if entries.iter().any(|entry| entry.error.is_some()) {
+        return Err(cli_error(
+            "some limit reads failed; other accounts are shown above",
+        ));
     }
 
     Ok(())
 }
 
-fn run_live(session: &mut CodexRpcSession, interval: Duration) -> Result<()> {
+struct LimitRead {
+    snapshot: Snapshot,
+    raw: Value,
+}
+
+enum LimitClient {
+    Codex {
+        codex_bin: String,
+        verbose: bool,
+        session: Option<CodexRpcSession>,
+    },
+    Claude(claude::ClaudeClient),
+}
+
+impl LimitClient {
+    fn provider(&self) -> &'static str {
+        match self {
+            Self::Codex { .. } => "codex",
+            Self::Claude(_) => "claude",
+        }
+    }
+
+    fn profile(&self) -> Option<&str> {
+        match self {
+            Self::Codex { .. } => None,
+            Self::Claude(client) => Some(&client.profile),
+        }
+    }
+
+    fn fetch(&mut self) -> Result<LimitRead> {
+        match self {
+            Self::Codex {
+                codex_bin,
+                verbose,
+                session,
+            } => {
+                let session = match session {
+                    Some(session) => session,
+                    None => session.insert(CodexRpcSession::connect(codex_bin, *verbose)?),
+                };
+                let response: RateLimitsResponse =
+                    serde_json::from_value(session.fetch_rate_limits()?)?;
+                let raw = json!({
+                    "primary": &response.rate_limits.primary,
+                    "secondary": &response.rate_limits.secondary,
+                });
+                Ok(LimitRead {
+                    snapshot: Snapshot::from_rpc(response.rate_limits),
+                    raw,
+                })
+            }
+            Self::Claude(client) => client.fetch(),
+        }
+    }
+}
+
+struct LimitEntry {
+    client: LimitClient,
+    latest: Option<LimitRead>,
+    error: Option<String>,
+    interval: Duration,
+    next_refresh: Instant,
+}
+
+impl LimitEntry {
+    fn new(client: LimitClient, interval: Option<u64>) -> Self {
+        let seconds = interval.unwrap_or(if client.provider() == "codex" {
+            10
+        } else {
+            180
+        });
+        Self {
+            client,
+            latest: None,
+            error: None,
+            interval: Duration::from_secs(seconds),
+            next_refresh: Instant::now(),
+        }
+    }
+
+    fn refresh_if_due(&mut self) {
+        if Instant::now() < self.next_refresh {
+            return;
+        }
+        let result = self.client.fetch();
+        self.record(result);
+        self.next_refresh = Instant::now() + self.interval;
+    }
+
+    fn record(&mut self, result: Result<LimitRead>) {
+        match result {
+            Ok(limits) => {
+                self.latest = Some(limits);
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    fn json(&self, raw: bool) -> Result<Value> {
+        let mut value = match &self.latest {
+            Some(limits) if raw => {
+                json!({"provider": self.client.provider(), "windows": limits.raw})
+            }
+            Some(limits) => serde_json::to_value(&limits.snapshot)?,
+            None => json!({"provider": self.client.provider()}),
+        };
+        if let Some(profile) = self.client.profile() {
+            value["profile"] = json!(profile);
+        }
+        if let Some(error) = &self.error {
+            value["error"] = json!(error);
+        }
+        Ok(value)
+    }
+}
+
+fn render_entries(entries: &[LimitEntry], color: bool, live: bool) -> String {
+    let mut output = String::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        output.push_str(&match &entry.latest {
+            Some(limits) => render_text(&limits.snapshot, entry.client.profile(), color),
+            None => render_header(entry.client.provider(), entry.client.profile(), color),
+        });
+        if let Some(error) = &entry.error {
+            if live {
+                output.push_str(&render_live_error(error, color));
+            } else {
+                output.push_str(&format!(
+                    "  {}\n",
+                    paint(&format!("⚠ {error}"), "31", color)
+                ));
+            }
+        }
+    }
+    output
+}
+
+fn run_live(entries: &mut [LimitEntry], cadence: &str) -> Result<()> {
     let color = use_color();
     let _terminal = LiveTerminalMode::enter()?;
     let input_rx = spawn_live_input_reader();
     let mut stdout = std::io::stdout().lock();
     let mut prev_lines = 0usize;
-    let mut last_body: Option<String> = None;
 
     loop {
-        let fetch_error = match session
-            .fetch_rate_limits()
-            .and_then(|raw_limits| Ok(serde_json::from_value::<RateLimitsResponse>(raw_limits)?))
-        {
-            Ok(limits_response) => {
-                let snapshot = Snapshot::from_rpc(limits_response.rate_limits);
-                last_body = Some(render_text(&snapshot, color));
-                None
+        for entry in entries.iter_mut() {
+            if input_rx.try_recv().is_ok() {
+                return Ok(());
             }
-            Err(error) => Some(error.to_string()),
-        };
+            entry.refresh_if_due();
+        }
 
-        let body = last_body.as_deref().unwrap_or("");
-        let error_line = fetch_error
-            .as_deref()
-            .map(|error| render_live_error(error, color))
-            .unwrap_or_default();
-        let footer = render_live_footer(interval, color);
-        let frame = format!("{body}{error_line}{footer}\n");
+        let body = render_entries(entries, color, true);
+        let footer = render_live_footer(cadence, color);
+        let frame = format!("{body}{footer}\n");
 
         if prev_lines > 0 {
             write!(stdout, "\x1b[{prev_lines}F\x1b[J")?;
@@ -114,7 +289,12 @@ fn run_live(session: &mut CodexRpcSession, interval: Duration) -> Result<()> {
 
         prev_lines = frame.matches('\n').count();
 
-        if wait_for_live_exit(&input_rx, interval) {
+        let wait = entries
+            .iter()
+            .map(|entry| entry.next_refresh.saturating_duration_since(Instant::now()))
+            .min()
+            .unwrap_or(Duration::from_secs(1));
+        if wait_for_live_exit(&input_rx, wait) {
             break;
         }
     }
@@ -124,15 +304,14 @@ fn run_live(session: &mut CodexRpcSession, interval: Duration) -> Result<()> {
 
 fn render_live_error(error: &str, color: bool) -> String {
     let now = Local::now().format("%H:%M:%S");
-    let message = truncate_chars(&error.replace(['\n', '\r'], " "), 70);
-    format!(
-        "{}\n",
-        paint(
-            &format!("  ⚠ {now} fetch failed, retrying: {message}"),
-            "31",
-            color
-        )
-    )
+    let message = truncate_chars(
+        &format!(
+            "  ⚠ {now} fetch failed, retrying: {}",
+            error.replace(['\n', '\r'], " ")
+        ),
+        78,
+    );
+    format!("{}\n", paint(&message, "31", color))
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -143,11 +322,10 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     format!("{truncated}…")
 }
 
-fn render_live_footer(interval: Duration, color: bool) -> String {
+fn render_live_footer(cadence: &str, color: bool) -> String {
     let now = Local::now().format("%H:%M:%S");
-    let secs = interval.as_secs().max(1);
     paint(
-        &format!("  updated {now} · every {secs}s · q/Ctrl-C to exit"),
+        &format!("  updated {now} · {cadence} · q/Ctrl-C to exit"),
         "2",
         color,
     )
@@ -271,13 +449,22 @@ fn is_rpc_transport_error(error: &(dyn Error + Send + Sync + 'static)) -> bool {
     error.downcast_ref::<RpcTransportError>().is_some()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    All,
+    Codex,
+    Claude,
+}
+
 #[derive(Debug)]
 struct Options {
+    provider: Provider,
     codex_bin: String,
+    claude_config_dirs: Vec<String>,
     json: bool,
     raw: bool,
     live: bool,
-    interval: u64,
+    interval: Option<u64>,
     verbose: bool,
     help: bool,
     version: bool,
@@ -286,13 +473,15 @@ struct Options {
 impl Options {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self> {
         let mut options = Options {
+            provider: Provider::All,
             codex_bin: env::var("CODELIM_CODEX_BIN")
                 .or_else(|_| env::var("CODEX_BIN"))
                 .unwrap_or_else(|_| "codex".to_string()),
+            claude_config_dirs: Vec::new(),
             json: false,
             raw: false,
             live: false,
-            interval: 10,
+            interval: None,
             verbose: false,
             help: false,
             version: false,
@@ -306,6 +495,21 @@ impl Options {
                 "--json" => options.json = true,
                 "--raw" => options.raw = true,
                 "--live" => options.live = true,
+                "--provider" => {
+                    options.provider = match args.next().as_deref() {
+                        Some("all") => Provider::All,
+                        Some("codex") => Provider::Codex,
+                        Some("claude") => Provider::Claude,
+                        _ => return Err(cli_error("--provider expects all, codex, or claude")),
+                    };
+                }
+                "--claude-config-dir" => {
+                    options.claude_config_dirs.push(
+                        args.next()
+                            .filter(|path| !path.is_empty() && !path.starts_with('-'))
+                            .ok_or_else(|| cli_error("--claude-config-dir requires a path"))?,
+                    );
+                }
                 "--interval" => {
                     let value = args
                         .next()
@@ -316,7 +520,7 @@ impl Options {
                     if secs == 0 {
                         return Err(cli_error("--interval must be at least 1 second"));
                     }
-                    options.interval = secs;
+                    options.interval = Some(secs);
                 }
                 "-v" | "--verbose" => options.verbose = true,
                 "--codex-bin" => {
@@ -335,11 +539,17 @@ impl Options {
 fn print_help() {
     println!(
         "{APP_NAME} {APP_VERSION}\n\n\
-Minimal local Codex quota checker.\n\n\
+Minimal Codex and Claude Code quota checker.\n\n\
 USAGE:\n    codelim [OPTIONS]\n\n\
-OPTIONS:\n    --json              Print normalized JSON\n    --raw               Print raw Codex limit windows\n    --live              Continuously refresh in-place; press q to exit (requires a TTY)\n    --interval <SECS>   Refresh interval for --live (default: 10)\n    --codex-bin <PATH>  Codex executable path (default: codex)\n    -v, --verbose       Print Codex app-server stderr\n    -h, --help          Print help\n    -V, --version       Print version\n\n\
-It starts: codex -s read-only app-server\n\
-and reads account/rateLimits/read from the local Codex CLI session."
+OPTIONS:\n    --provider <NAME>         all (default), codex, or claude\n    --json                    Print normalized JSON results for all accounts\n    --raw                     Print raw limit windows for all accounts\n    --live                    Refresh in-place; q/Ctrl-C to exit (TTY only)\n    --interval <SECS>         Override refresh cadence for every account\n    --codex-bin <PATH>        Codex executable path (default: codex)\n    --claude-config-dir <DIR> Add a Claude account directory (repeatable)\n    -v, --verbose             Print Codex app-server stderr\n    -h, --help                Print help\n    -V, --version             Print version\n\n\
+Shows Codex and all discovered Claude accounts together by default.\n\
+Claude discovery: default login, ~/.claude[-_]* directories, environment\n\
+CLAUDE_CONFIG_DIR / CLAUDE_SECURESTORAGE_CONFIG_DIR, and explicit directories.\n\
+Each account refreshes independently: Codex every 10s, Claude every 180s.\n\
+Codex: starts codex -s read-only app-server and reads account/rateLimits/read.\n\
+Claude: reads existing Claude Code credentials and queries the OAuth usage API.\n\
+Credentials are read-only; no automatic login or token refresh.\n\n\
+EXAMPLES:\n    codelim\n    codelim --live\n    codelim --provider claude --json\n    codelim --claude-config-dir /accounts/work --claude-config-dir /accounts/personal"
     );
 }
 
@@ -647,21 +857,43 @@ fn take_first(windows: &mut Vec<RateWindow>) -> Option<RateWindow> {
     }
 }
 
-fn render_text(snapshot: &Snapshot, color: bool) -> String {
+fn render_text(snapshot: &Snapshot, profile: Option<&str>, color: bool) -> String {
+    let mut out = render_header(snapshot.provider, profile, color);
+    render_section(&mut out, "5-hour", snapshot.limits.session.as_ref(), color);
+    render_section(&mut out, "Weekly", snapshot.limits.weekly.as_ref(), color);
+    out
+}
+
+fn render_header(provider: &str, profile: Option<&str>, color: bool) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
     let rule = "──────────────────────────────────────────";
+    let (title, source) = match provider {
+        "claude" => ("Claude limits", "Claude Code OAuth API"),
+        _ => ("Codex limits", "local Codex CLI RPC"),
+    };
+    let title = match profile {
+        Some(profile) => format!(
+            "{title} [{}]",
+            truncate_chars(
+                &profile
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .collect::<String>(),
+                32
+            )
+        ),
+        None => title.to_string(),
+    };
 
     let _ = writeln!(
         out,
         "  {}  {}",
-        paint("Codex limits", "1;36", color),
-        paint("local Codex CLI RPC", "2", color),
+        paint(&title, "1;36", color),
+        paint(source, "2", color),
     );
     let _ = writeln!(out, "  {}", paint(rule, "2", color));
-    render_section(&mut out, "5-hour", snapshot.limits.session.as_ref(), color);
-    render_section(&mut out, "Weekly", snapshot.limits.weekly.as_ref(), color);
     out
 }
 
@@ -767,6 +999,52 @@ fn human_duration(seconds: i64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn defaults_to_all_and_accepts_multiple_claude_directories() {
+        let defaults = Options::parse(std::iter::empty()).unwrap();
+        assert_eq!(defaults.provider, Provider::All);
+        assert_eq!(defaults.interval, None);
+        assert!(defaults.claude_config_dirs.is_empty());
+
+        let options = Options::parse(
+            [
+                "--provider",
+                "claude",
+                "--claude-config-dir",
+                "/tmp/claude work/",
+                "--claude-config-dir",
+                "/tmp/claude-personal",
+                "--live",
+                "--interval",
+                "240",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap();
+        assert_eq!(options.provider, Provider::Claude);
+        assert_eq!(
+            options.claude_config_dirs,
+            ["/tmp/claude work/", "/tmp/claude-personal"]
+        );
+        assert!(options.live);
+        assert_eq!(options.interval, Some(240));
+    }
+
+    #[test]
+    fn rejects_invalid_provider_and_profile_arguments() {
+        for args in [
+            vec!["--provider"],
+            vec!["--provider", "unknown"],
+            vec!["--claude-config-dir"],
+            vec!["--claude-config-dir", "--json"],
+            vec!["--claude-config-dir", ""],
+            vec!["--provider", "claude", "--interval", "0"],
+        ] {
+            assert!(Options::parse(args.into_iter().map(str::to_string)).is_err());
+        }
+    }
+
     fn window(duration_mins: Option<i64>) -> RateWindow {
         RateWindow {
             used_percent: 25.0,
@@ -833,7 +1111,7 @@ mod tests {
         );
 
         for color in [false, true] {
-            let text = render_text(&snapshot, color);
+            let text = render_text(&snapshot, None, color);
             assert!(text.contains("━━━━━━━━━┄┄┄┄┄┄┄┄┄┄┄"));
             assert!(text.contains("43% left"));
             let reset_prefix = if color {
