@@ -4,6 +4,8 @@ All notable changes to `codelim` are tracked here.
 
 ## Unreleased
 
+## 0.1.8 - 2026-10-07
+
 - Added Claude Code subscription 5-hour and weekly limits alongside Codex. The default now displays Codex and all discovered Claude account directories together, rather than requiring separate invocations. `--provider all|codex|claude` can filter the display.
 - Discover Claude's default login, `~/.claude-*` / `~/.claude_*` directories, and directories from `CLAUDE_CONFIG_DIR` / `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Repeatable `--claude-config-dir` arguments add other locations; repeated credential stores are deduplicated. Reads only the matching Keychain item or same-directory credentials file, without changing or refreshing credentials. Directory labels distinguish accounts without printing emails, tokens, or credits.
 - Keep each account's live snapshot, error, and refresh schedule independent: Codex defaults to 10 seconds and Claude to 180 seconds. Failed account reads, including Codex startup failures, no longer prevent other accounts from being shown. One-shot reads print all results and exit nonzero if any failed. Live error lines are truncated as a whole to fit an 80-column terminal.
